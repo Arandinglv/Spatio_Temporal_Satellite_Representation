@@ -1,0 +1,14 @@
+*.pth
+*.txt
+*.pdf
+*.json
+__pycache__
+baselines/
+SpatioTemporal/exceptions/__pycache__/
+SpatioTemporal/models/__pycache__/
+SpatioTemporal/utils/__pycache__/
+SpatioTemporal/debug.pyc
+SpatioTemporal/test_data/
+*.zip
+SpatioTemporal_old
+temp/
