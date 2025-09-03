@@ -5,7 +5,7 @@ from datetime import datetime
 import os
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 # from utils import save_config_file, accuracy, save_checkpoint
 
 from models.simclr_resnet import ResNetSimCLR
@@ -14,7 +14,6 @@ from utils.utils import accuracy, save_checkpoint, save_config_file
 from utils.loss import ContrastiveLoss
 
 torch.manual_seed(0)
-
 
 
 class SimCLRSpatilTemporal(object):
@@ -31,25 +30,36 @@ class SimCLRSpatilTemporal(object):
         self.model = kwargs['model'].to(self.args.device)
         self.optimizer = kwargs['optimizer']
         self.scheduler = kwargs['scheduler']
-        self.writer = SummaryWriter(log_dir=self.args.log_dir)
+        
+        # Initialize wandb
+        wandb.init(
+            project=self.args.wandb_project,
+            name=self.args.experiment_name,
+            config=vars(self.args),
+            mode="online"
+        )
+        
         logging.basicConfig(
-            filename=os.path.join(self.writer.log_dir, 'training.log'),
+            filename=os.path.join(self.args.log_dir, 'training.log'),
             level=logging.DEBUG,
             format='%(asctime)s %(levelname)s:%(message)s'
         )
         self.Contrastive_loss = ContrastiveLoss(self.args)
-        self.spatial_loss = self.Contrastive_loss.spatial_loss
-        self.spatial_temporal_loss = self.Contrastive_loss.spatial_temporal_loss
+        # 使用现有的loss函数
+        self.spatial_loss = self.Contrastive_loss.spatial_group_smoothing_loss
+        self.spatial_temporal_loss = self.Contrastive_loss.group_spatial_temporal_loss
         self.temporal_loss = self.Contrastive_loss.temporal_loss
+        self.temporal_soft_loss = self.Contrastive_loss.temporal_soft_loss
         self.accuracy = accuracy
                     
         
     def train(self, train_loader):
         scaler = GradScaler(enabled=self.args.mixed_precision)
         
-        save_config_file(self.writer.log_dir, self.args) 
+        save_config_file(self.args.log_dir, self.args) 
         
         n_iter = 0
+        best_loss = float('inf')
         logging.info(f"Start SimCLRTemporalSpatial training for {self.args.epochs} epochs.")
         logging.info(f"Training on device: {self.args.device}.")
         
@@ -80,17 +90,34 @@ class SimCLRSpatilTemporal(object):
                     temporal_negatives = temporal_negatives.view(self.args.batch_size, self.args.num_neg, -1)
                     # temporal_negatives: [batch_size, num_neg, feature_dim=128]
                     
-                    # 计算损失
-                    spatial_logits, spatial_labels_ce, spatial_loss = self.spatial_loss(features)
-                    temporal_logits, \
-                        temporal_labels_ce, \
-                            temporal_loss = self.temporal_loss(features=features, temporal_negatives=temporal_negatives)
+                    # 计算4个损失函数
+                    # 1. spatial_group_smoothing_loss
+                    spatial_loss = self.spatial_loss(features)
                     
-                    spatial_temporal_logits, \
-                        spatial_temporal_labels, \
-                            spatial_temporal_loss = self.spatial_temporal_loss(features=features, temporal_negatives=temporal_negatives)
+                    # 2. temporal_loss  
+                    temporal_logits, temporal_labels_ce, temporal_loss = self.temporal_loss(features=features, temporal_negatives=temporal_negatives)
+                    
+                    # 3. temporal_soft_loss (需要虚拟参数)
+                    anchors = features[:, 0, :]  # [batch_size, feature_dim]
+                    actual_batch_size = anchors.size(0)
+                    
+                    dummy_negative_ratios = torch.ones(actual_batch_size, self.args.num_neg, 12).to(self.args.device)
+                    dummy_label_emb = torch.randn(12, 768).to(self.args.device)
+                    temporal_soft_logits, temporal_soft_labels, temporal_soft_loss, indices, _ = self.temporal_soft_loss(
+                        anchors, temporal_negatives, 
+                        dummy_negative_ratios, 
+                        dummy_label_emb
+                    )
+                    
+                    # 4. group_spatial_temporal_loss
+                    spatial_temporal_loss = self.spatial_temporal_loss(
+                        anchors, temporal_negatives, indices
+                    )
             
-                    loss = 0.4 * spatial_loss + 0.4 * temporal_loss + 0.2 * spatial_temporal_loss   
+                    loss = (self.args.spatial_weight * spatial_loss + 
+                           self.args.temporal_weight * temporal_loss + 
+                           self.args.temporal_soft_weight * temporal_soft_loss +
+                           self.args.spatial_temporal_weight * spatial_temporal_loss)   
                     
 
                 self.optimizer.zero_grad()
@@ -100,22 +127,25 @@ class SimCLRSpatilTemporal(object):
                     
                 # 日志记录
                 if n_iter % self.args.log_every_n_steps == 0:
-                    top1_spatial_acc, top5_spatial_acc = self.accuracy(spatial_logits, spatial_labels_ce, topk=(1, 5))
-                    top1_temporal_acc, top5_temporal_acc = self.accuracy(temporal_logits, temporal_labels_ce, topk=(1, 5))
-                    top1_spatial_temporal_acc, top5_spatial_temporal_acc = \
-                        self.accuracy(spatial_temporal_logits, spatial_temporal_labels, topk=(1, 5))
-                    # loss 计算
-                    self.writer.add_scalar('loss/spatial', spatial_loss.item(), global_step=n_iter)
-                    self.writer.add_scalar('loss/temporal', temporal_loss.item(), global_step=n_iter)
-                    self.writer.add_scalar('loss/spatial_temporal', spatial_temporal_loss.item(), global_step=n_iter)
-                    self.writer.add_scalar('loss/total', loss.item(), global_step=n_iter)
-                    self.writer.add_scalar('accuracy/top1_spatial', top1_spatial_acc, global_step=n_iter)
-                    self.writer.add_scalar('accuracy/top5_spatial', top5_spatial_acc, global_step=n_iter)
-                    self.writer.add_scalar('accuracy/top1_temporal', top1_temporal_acc, global_step=n_iter)
-                    self.writer.add_scalar('accuracy/top5_temporal', top5_temporal_acc, global_step=n_iter)
-                    self.writer.add_scalar('accuracy/top1_spatial_temporal', top1_spatial_temporal_acc, global_step=n_iter)
-                    self.writer.add_scalar('accuracy/top5_spatial_temporal', top5_spatial_temporal_acc, global_step=n_iter)
-                    self.writer.add_scalar('learning_rate', self.optimizer.param_groups[0]['lr'], global_step=n_iter)
+                    metrics = {
+                        'loss/spatial': spatial_loss.item(),
+                        'loss/temporal': temporal_loss.item(),
+                        'loss/temporal_soft': temporal_soft_loss.item(),
+                        'loss/spatial_temporal': spatial_temporal_loss.item(),
+                        'loss/total': loss.item(),
+                        'learning_rate': self.optimizer.param_groups[0]['lr'],
+                        'epoch': epoch
+                    }
+                    
+                    # 计算精度(只有temporal_loss有logits)
+                    if temporal_logits is not None and temporal_labels_ce is not None:
+                        top1_temporal_acc, top5_temporal_acc = self.accuracy(temporal_logits, temporal_labels_ce, topk=(1, 5))
+                        metrics.update({
+                            'accuracy/top1_temporal': top1_temporal_acc[0].item() if hasattr(top1_temporal_acc, 'item') else top1_temporal_acc,
+                            'accuracy/top5_temporal': top5_temporal_acc[0].item() if hasattr(top5_temporal_acc, 'item') else top5_temporal_acc
+                        })
+                    
+                    wandb.log(metrics, step=n_iter)
 
                 n_iter += 1
                 
@@ -124,45 +154,70 @@ class SimCLRSpatilTemporal(object):
                 self.scheduler.step()
 
             # 记录每个 epoch 的损失
-            logging.debug(f"Epoch: {epoch+1}\
-                            \tSpatial Loss: {spatial_loss.item():.4f}\
-                            \tTemporal Loss: {temporal_loss.item():.4f}\
-                            \tSpatial Temporal Loss: {spatial_temporal_loss.item():.4f}\
-                            \tTotal Loss: {loss.item():.4f}\
-                                \tSpatial Top-1 Accuracy: {top1_spatial_acc[0]:.4f}\
-                                \tSpatial Top-5 Accuracy: {top5_spatial_acc[0]:.4f}\
-                                \tTemporal Top-1 Accuracy: {top1_temporal_acc[0]:.4f}\
-                                \tTemporal Top-5 Accuracy: {top5_temporal_acc[0]:.4f}\
-                                \tSpatial Temporal Top-1 Accuracy: {top1_spatial_temporal_acc[0]:.4f}\
-                                \tSpatial Temporal Top-5 Accuracy: {top5_spatial_temporal_acc[0]:.4f}\
-                                    \tLearning Rate: {self.optimizer.param_groups[0]['lr']:.4f}")
-            # logging.debug(f"Epoch: {epoch+1}\tSpatial Loss: {spatial_loss.item():.4f}\
-            #                 \tSpatial Temporal Loss: {spatial_temporal_loss.item():.4f}\
-            #                   \tTotal Loss: {loss.item():.4f}\
-            #                       \tLearning Rate: {self.optimizer.param_groups[0]['lr']:.4f}\
-            #                           \tSpatial Top-1 Accuracy: {top1_spatial_acc[0]:.4f}\
-            #                               \tSpatial Top-5 Accuracy: {top5_spatial_acc[0]:.4f}")
-            self.writer.add_scalar('epoch/spatial_loss', spatial_loss.item(), global_step=epoch)
-            self.writer.add_scalar('epoch/temporal_loss', temporal_loss.item(), global_step=epoch)
-            self.writer.add_scalar('epoch/spatial_temporal_loss', spatial_temporal_loss.item(), global_step=epoch)
-            self.writer.add_scalar('epoch/total_loss', loss.item(), global_step=epoch)
-            self.writer.add_scalar('epoch/learning_rate', self.optimizer.param_groups[0]['lr'], global_step=epoch)
-            self.writer.add_scalar('epoch/top1_spatial', top1_spatial_acc, global_step=epoch)
-            self.writer.add_scalar('epoch/top5_spatial', top5_spatial_acc, global_step=epoch)
-            self.writer.add_scalar('epoch/top1_temporal', top1_temporal_acc, global_step=epoch)
-            self.writer.add_scalar('epoch/top5_temporal', top5_temporal_acc, global_step=epoch)
-            self.writer.add_scalar('epoch/top1_spatial_temporal', top1_spatial_temporal_acc, global_step=epoch)
-            self.writer.add_scalar('epoch/top5_spatial_temporal', top5_spatial_temporal_acc, global_step=epoch)
+            epoch_metrics = {
+                'epoch/spatial_loss': spatial_loss.item(),
+                'epoch/temporal_loss': temporal_loss.item(),
+                'epoch/temporal_soft_loss': temporal_soft_loss.item(),
+                'epoch/spatial_temporal_loss': spatial_temporal_loss.item(),
+                'epoch/total_loss': loss.item(),
+                'epoch/learning_rate': self.optimizer.param_groups[0]['lr']
+            }
             
-            # break  
+            if temporal_logits is not None and temporal_labels_ce is not None:
+                top1_temporal_acc, top5_temporal_acc = self.accuracy(temporal_logits, temporal_labels_ce, topk=(1, 5))
+                epoch_metrics.update({
+                    'epoch/top1_temporal': top1_temporal_acc[0].item() if hasattr(top1_temporal_acc, 'item') else top1_temporal_acc,
+                    'epoch/top5_temporal': top5_temporal_acc[0].item() if hasattr(top5_temporal_acc, 'item') else top5_temporal_acc
+                })
+            
+            wandb.log(epoch_metrics, step=epoch)
+            
+            logging.debug(f"Epoch: {epoch+1}\tSpatial Loss: {spatial_loss.item():.4f}\tTemporal Loss: {temporal_loss.item():.4f}\tSpatial Temporal Loss: {spatial_temporal_loss.item():.4f}\tTotal Loss: {loss.item():.4f}\tLearning Rate: {self.optimizer.param_groups[0]['lr']:.4f}")
 
+            # 检查点保存(每50轮)
+            if (epoch + 1) % 50 == 0:
+                checkpoint_name = f'checkpoint_epoch_{epoch+1:04d}.pth'
+                checkpoint_path = os.path.join(self.args.log_dir, checkpoint_name)
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'arch': self.args.arch,
+                    'state_dict': self.model.state_dict(),
+                    'optimizer': self.optimizer.state_dict(),
+                    'scheduler': self.scheduler.state_dict(),
+                    'loss': loss.item(),
+                    'wandb_run_id': wandb.run.id
+                }, is_best=False, filename=checkpoint_path)
+                logging.info(f"Checkpoint saved at {checkpoint_path}")
+            
+            # 保存最佳模型
+            current_loss = loss.item()
+            if current_loss < best_loss:
+                best_loss = current_loss
+                best_checkpoint_path = os.path.join(self.args.log_dir, 'best.pth')
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'arch': self.args.arch,
+                    'state_dict': self.model.state_dict(),
+                    'optimizer': self.optimizer.state_dict(),
+                    'scheduler': self.scheduler.state_dict(),
+                    'best_loss': best_loss,
+                    'wandb_run_id': wandb.run.id
+                }, is_best=True, filename=best_checkpoint_path)
+                logging.info(f"New best model saved with loss: {best_loss:.4f}")
+        
         logging.info("Training has finished.")
-        # 保存模型检查点
-        checkpoint_name = 'checkpoint_{:04d}.pth.tar'.format(self.args.epochs)
+        # 保存最终模型
+        final_checkpoint_name = f'final_checkpoint_epoch_{self.args.epochs:04d}.pth'
+        final_checkpoint_path = os.path.join(self.args.log_dir, final_checkpoint_name)
         save_checkpoint({
             'epoch': self.args.epochs,
             'arch': self.args.arch,
             'state_dict': self.model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
-        }, is_best=False, filename=os.path.join(self.writer.log_dir, checkpoint_name))
-        logging.info(f"Model checkpoint and metadata has been saved at {self.writer.log_dir}.")
+            'scheduler': self.scheduler.state_dict(),
+            'final_loss': loss.item(),
+            'wandb_run_id': wandb.run.id
+        }, is_best=False, filename=final_checkpoint_path)
+        logging.info(f"Final model checkpoint saved at {final_checkpoint_path}")
+        
+        wandb.finish()
