@@ -12,12 +12,15 @@ from datasets.STlabelpositive_dataset import STlabelpositive
 from exceptions.exceptions import InvalidDatasetSelection
 from datasets.STlabel_dataset import STlabel
 from datasets.STlabel_spatio_same_dataset import STlabel_spatio_same
+from datasets.STlabel_dataset_group import STlabelScoreGroupDataset
 
 
 class ContrastiveLearningDataset:
-    def __init__(self, root_folder, num_neg):
+    def __init__(self, root_folder, num_neg, max_epoch=200, current_epoch=0):
         self.root_folder = root_folder
         self.num_neg = num_neg
+        self.max_epoch = max_epoch
+        self.current_epoch = current_epoch
         
     @staticmethod
     # get_simclr_pipeline_transform是静态方法, 
@@ -28,7 +31,7 @@ class ContrastiveLearningDataset:
         sobel, gray, gaussianBlur, rotate, 
         colorJitter, Normalize
         """
-        color_jitter = transforms.ColorJitter(0.8 * s, 0.8 * s, 0.8 * s, 0.2 * s)
+        color_jitter = transforms.ColorJitter(0.8 * s, 0.8 * s, 0.8 * s, 0)
         data_transforms = transforms.Compose([
             transforms.RandomResizedCrop(size=size),
             transforms.RandomHorizontalFlip(p=0.4), 
@@ -103,6 +106,17 @@ class ContrastiveLearningDataset:
                 transform_neg=self.get_simclr_pipeline_transform(224)
             ), 
             
+            'STlabelScoreGroupDataset': lambda:STlabelScoreGroupDataset(
+                self.root_folder,
+                num_neg=self.num_neg,
+                transform = ContrastiveLearningViewGenerator(
+                    self.get_simclr_pipeline_transform(224),
+                    n_views=2
+                ),
+                transform_neg=self.get_simclr_pipeline_transform(224),
+                max_epoch=self.max_epoch,
+                current_epoch=self.current_epoch
+            ),
             
         }  
         try:
