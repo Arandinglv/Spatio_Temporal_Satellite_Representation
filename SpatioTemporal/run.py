@@ -13,97 +13,84 @@ from utils.collate_fn import custom_collate_fn
 from models.simclr_resnet import ResNetSimCLR
 from simclr import SimCLRSpatilTemporal
 
-from warmup_scheduler import GradualWarmupScheduler
 
-
-# TODO:设置RESUME 断点续训
-
-# 最后parser中的的连词符都会变成下划线
 def main():
     parser = argparse.ArgumentParser(description='PyTorch SimCLR with Spatio-Temporal Contrastive Learning')   
-    # 数据集位置 
-    parser.add_argument('--data', default='/data/yutianjiang/multi_temporal/Shanghai/Data_temp/jpg', 
+    
+    # 数据集参数
+    parser.add_argument('--data', default='/data/yutianjiang/multi_temporal/Guangzhou/Data_temp/jpg', 
                         help='path to dataset root folder')
-    # 数据集名称, 按照ContrastiveLearningDataset中的标准
-    parser.add_argument('--dataset-name', default='SpatioTemporalDataset', 
+    parser.add_argument('--dataset-name', default='STlabelScoreGroupDataset', 
                         help='dataset name', choices=['stl10', 'cifar10', 
-                                                        'SpatioTemporalDataset',  # 不带label的原生数据集
+                                                        'SpatioTemporalDataset',
                                                         'STlabelpositive',   
-                                                        # 带label, 相同label不同年作为正样本(对于三个loss都是)
                                                         'STlabel',   
-                                                        # 带label, positive是自己的transform, 
                                                         'STlabel_spatio_same', 
-                                                        # 带label, positive是自己的transform, 同一个batchsize内的anchor样本来自于同一年
+                                                        'STlabelScoreGroupDataset'  # 修正名称
                                                         ])
-    # 模型名字
-    parser.add_argument('--arch', default='resnet18', choices=['resnet18', 'resnet50'],
-                        help='model architecture: resnet18 or resnet50 (default: resnet18)')
-    # workers数量
+    
+    # 模型参数
+    parser.add_argument('--arch', default='resnet50', choices=['resnet18', 'resnet50'],
+                        help='model architecture')
+    parser.add_argument('--out_dim', default=128, type=int, 
+                        help='feature dimension (default: 128)')
+    
+    # 训练参数
     parser.add_argument('--workers', default=12, type=int, metavar='N',
                         help='number of data loading workers (default: 12)')
-    # 迭代次数
-    parser.add_argument('--epochs', default=200, type=int, metavar='N', 
+    parser.add_argument('--epochs', default=100, type=int, metavar='N', 
                         help='number of total epochs to run')
-    # batch-size (应该等于4 * group_num)
-    parser.add_argument('--batch-size', default=16, type=int, metavar='N',  
-                        help='mini-batch size (should be 4 * group_num for group loss)')
-    # learning_rate
+    parser.add_argument('--batch-size', default=32, type=int, metavar='N',  
+                        help='mini-batch size (group_num)')
     parser.add_argument('--lr', default=0.0003, type=float, metavar='LR',
                         help='initial learning rate')
-    # weight_decay
     parser.add_argument('--weight-decay', default=1e-4, type=float, metavar='W',    
                         help='weight decay (default: 1e-4)')
-    # 随机数种子
-    parser.add_argument('--seed', default=None, type=int, 
+    parser.add_argument('--seed', default=42, type=int, 
                         help='seed for initializing training.')
-    # 是否禁用cuda
-    parser.add_argument('--cuda', default=True, action='store_true',
-                        help='Use cuda for training')  
-    # 默认为True, 命令行中出现--disable-cuda时, 会禁用cuda
     
-    # # 用几号卡
-    # parser.add_argument('--gpu-index', default=2, type=int, help='GPU Index')
-    # 时空对比学习损失函数的权重
-    parser.add_argument('--lambda_temporal', default=1.0, type=float, 
+    # 对比学习参数
+    parser.add_argument('--lambda_temporal', default=0.5, type=float, 
                         help='Weight for temporal contrastive loss')
-    # # 时间负样本每个年份增强的数量
-    # parser.add_argument('--num_tempo_neg_aug', default=10, type=int, 
-    #                     help='Number of temporal negative samples')
-    
-    # 时间负样本数量
     parser.add_argument('--num_neg', default=20, type=int, 
                         help='Number of temporal negative samples')
-    # log保存位置
-    parser.add_argument('--log_root', default=
-                        '/data/yutianjiang/training_results/simclr/2010_2019', 
-                        help='Root directory for logging')
-    # 混精训练, 改成单精度避免溢出
-    parser.add_argument('--mixed-precision', default=False, action='store_true',
-                        help='Use mixed precision training (fp32 only to avoid overflow)')
-    # projection_head的维度大小
-    parser.add_argument('--out_dim', default=128, type=int, help='feature dimension (default: 128)')
-    # 记录, 不变
-    parser.add_argument('--log-every-n-steps', default=100, type=int, 
-                        help='Log every n steps')
-    # softmax温度系数, 不变
     parser.add_argument('--temperature', default=0.07, type=float, 
                         help='softmax temperature (default: 0.07)')
-    # 视图数, 不变
     parser.add_argument('--n-views', default=2, type=int, metavar='N', 
                         help='Number of views for contrastive learning training.')
-    # warmup
-    parser.add_argument('--warmup-epochs', default=0, type=int,
+    
+    # 日志和保存参数
+    parser.add_argument('--log_root', default=
+                        '/data/yutianjiang/training_results/spatio_temporal/Guangzhou/Ablation/ablation_debug/pretrain', 
+                        help='Root directory for logging')
+    parser.add_argument('--log-every-n-steps', default=100, type=int, 
+                        help='Log every n steps')
+    parser.add_argument('--warmup-epochs', default=20, type=int,
                         help='Number of warmup epochs before applying scheduler')
     
-    # 断点续训
-    parser.add_argument('--resume', action='store_true',
-                        help='Resume training from checkpoint')
-    # checkpoint保存地址
-    # TODO: 保存在log_root下方
-    parser.add_argument('--checkpoint-path', default='/data/yutianjiang/training_results',
-                        type=str, metavar='PATH', help='path to save checkpoint')
-    parser.add_argument('--description', default='simclr', type=str,
-                        help='Description of the experiment, as the name of the log folder')
+    # Label和模式参数
+    parser.add_argument('--labels_str', default="['dense houses', 'trees', 'grass', 'river', 'barren land', 'sidewalks', 'farmland', 'tall buildings', 'soil', 'crop fields', 'roads']", 
+                        type=str, help='Labels string for embedding')
+    parser.add_argument('--MODE', default='group-spatial_temporal', type=str,
+                        help='Training mode')
+    parser.add_argument('--log_tag', default='debug', type=str,
+                        help='Log tag for experiment identification')
+    
+    # Group参数
+    parser.add_argument('--group_num', default=4, type=int,
+                        help='Number of groups (should match batch_size)')
+    parser.add_argument('--group_element', default=4, type=int,
+                        help='Number of elements per group')
+    parser.add_argument('--group', default=True, action='store_true',
+                        help='Use group loss functions')
+    parser.add_argument('--epsilon', default=0.1, type=float,
+                        help='Epsilon for label smoothing in spatial group loss')
+    
+    # 设备参数
+    parser.add_argument('--cuda', default=True, action='store_true',
+                        help='Use cuda for training')
+    parser.add_argument('--mixed-precision', default=False, action='store_true',
+                        help='Use mixed precision training')
     
     # Wandb 参数
     parser.add_argument('--wandb-project', default='stmodel-simclr', type=str,
@@ -111,139 +98,136 @@ def main():
     parser.add_argument('--experiment-name', default=None, type=str,
                         help='Experiment name for wandb')
     
-    # Loss 权重参数 (4个loss函数)
-    parser.add_argument('--spatial-weight', default=0.25, type=float,
+    # Loss 权重参数
+    parser.add_argument('--spatial-weight', default=0.3, type=float,
                         help='Weight for spatial group smoothing loss')
-    parser.add_argument('--temporal-weight', default=0.25, type=float,
+    parser.add_argument('--temporal-weight', default=0.3, type=float,
                         help='Weight for temporal loss')
-    parser.add_argument('--temporal-soft-weight', default=0.25, type=float,
+    parser.add_argument('--temporal-soft-weight', default=0.2, type=float,
                         help='Weight for temporal soft loss')
-    parser.add_argument('--spatial-temporal-weight', default=0.25, type=float,
+    parser.add_argument('--spatial-temporal-weight', default=0.2, type=float,
                         help='Weight for group spatial-temporal loss')
     
-    # Group loss 参数
-    parser.add_argument('--group', default=True, action='store_true',
-                        help='Use group loss functions')
-    parser.add_argument('--group-num', default=4, type=int,
-                        help='Number of groups for group loss (batch_size should be 4 * group_num)')
-    parser.add_argument('--group-element', default=4, type=int,
-                        help='Number of elements per group (should be 4 for tiles)')
-    parser.add_argument('--epsilon', default=0.1, type=float,
-                        help='Epsilon for label smoothing in group loss')
-    
+    # 断点续训
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume training from checkpoint')
+    parser.add_argument('--checkpoint-path', default='', type=str,
+                        help='path to checkpoint for resume')
     
     args = parser.parse_args()
+    
+    # 设置随机种子
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        import numpy as np
+        import random
+        np.random.seed(args.seed)
+        random.seed(args.seed)
+    
+    # 验证group参数 - batch_size就是group_num
+    if args.group:
+        # 确保batch_size就是group_num
+        args.group_num = args.batch_size
+        print(f"Group mode: group_num={args.group_num}, group_element={args.group_element}")
+        print(f"Effective batch size: {args.group_num * args.group_element}")
     
     # Wandb 实验名称设置
     if args.experiment_name is None:
         current_time = datetime.now().strftime('%Y%m%d_%H%M')
-        args.experiment_name = f"{args.description}_{current_time}"
+        args.experiment_name = f"{args.MODE}_{args.log_tag}_{current_time}"
     
-    # 验证group参数
-    if args.group:
-        expected_batch_size = args.group_element * args.group_num
-        if args.batch_size != expected_batch_size:
-            print(f"Warning: batch_size ({args.batch_size}) should equal group_element * group_num ({expected_batch_size})")
-            print(f"Adjusting batch_size to {expected_batch_size}")
-            args.batch_size = expected_batch_size
-    
-    # 保存路径: root_dir -> project_name -> experiment_name
-    log_dir = os.path.join(args.log_root, args.wandb_project, args.experiment_name)
+    # 保存路径设置
+    log_dir = os.path.join(args.log_root, args.experiment_name)
     os.makedirs(log_dir, exist_ok=True)
     args.log_dir = log_dir
     
-    assert args.n_views == 2, \
-        "Only two view training is supported. Please use --n-views 2."
-    
-    # 是否使用gpu
+    # 设备设置
     if torch.cuda.is_available() and args.cuda:
-        # os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_index)
         args.device = torch.device('cuda')
-        cudnn.deterministic = True  # 提高实验的可重复性
+        cudnn.deterministic = True
         cudnn.benchmark = True
         print('========== Using GPU ==========')
     else: 
         args.device = torch.device('cpu')
-        args.gpu_index = -1
         print('========== Using CPU ==========')
         
-
-        
+    assert args.n_views == 2, "Only two view training is supported. Please use --n-views 2."
+    
+    # Resume处理
+    start_epoch = 0
+    wandb_run_id = None
+    if args.resume and args.checkpoint_path and os.path.isfile(args.checkpoint_path):
+        checkpoint = torch.load(args.checkpoint_path, map_location=args.device)
+        start_epoch = checkpoint['epoch']
+        if 'wandb_run_id' in checkpoint:
+            wandb_run_id = checkpoint['wandb_run_id']
+        print(f"Resuming from epoch {start_epoch}")
     
     # 准备数据集
-    dataset = ContrastiveLearningDataset(args.data, args.num_neg)
+    dataset = ContrastiveLearningDataset(
+        args.data, 
+        args.num_neg, 
+        max_epoch=args.epochs, 
+        current_epoch=start_epoch
+    )
     train_dataset = dataset.get_dataset(args.dataset_name, args.n_views)
     
-    # 直接使用标准DataLoader，依赖dataset和collate_fn处理group数据
+    # DataLoader - batch_size就是group_num
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=args.batch_size,
+        batch_size=args.batch_size,  # 这里就是group_num
         shuffle=True, 
         num_workers=args.workers,
         pin_memory=True,
-        drop_last=True,  # 丢弃最后一个不完整的批次
+        drop_last=True,
         collate_fn=custom_collate_fn
     )
-        
+    
+    # 模型创建
     model = ResNetSimCLR(base_model=args.arch, out_dim=args.out_dim)
     
-    # 使用单精度训练避免溢出
-    if args.mixed_precision:
-        print('Using mixed precision training (fp32 only)')
-    else:
-        print('Using fp32 precision training')
+    # 优化器和调度器
+    optimizer = torch.optim.Adam(
+        model.parameters(), 
+        args.lr, 
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.999)
+    )
     
-    # TODO: 先用linear scale rule预热然后余弦退火
-    optimizer = torch.optim.Adam(model.parameters(), args.lr, betas=(0.9, 0.999))
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    #     optimizer, T_max=len(train_loader)*args.epochs, eta_min=0, last_epoch=-1)
-    
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer=optimizer, 
-        T_max=len(train_loader) * (args.epochs - args.warmup_epochs),
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=len(train_loader) * args.epochs, 
         eta_min=0, 
         last_epoch=-1
     )
-    
-    scheduler = GradualWarmupScheduler(
-        optimizer,  
-        multiplier=1,   
-        total_epoch=args.warmup_epochs,    
-        after_scheduler=cosine_scheduler   
-    )
 
+    # Resume模型状态
+    if args.resume and args.checkpoint_path and os.path.isfile(args.checkpoint_path):
+        checkpoint = torch.load(args.checkpoint_path, map_location=args.device)
+        model.load_state_dict(checkpoint['state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        if 'scheduler' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler'])
     
-    
-    # ==================== RESUME ====================
-    start_epoch = 0
-    wandb_run_id = None
-    if args.resume:
-        if os.path.isfile(args.checkpoint_path):
-            checkpoint = torch.load(args.checkpoint_path, map_location=args.device)
-            start_epoch = checkpoint['epoch']
-            model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            if 'scheduler' in checkpoint:
-                scheduler.load_state_dict(checkpoint['scheduler'])
-            if 'wandb_run_id' in checkpoint:
-                wandb_run_id = checkpoint['wandb_run_id']
-            print(f"Resuming from epoch {start_epoch}")
-        else:
-            print(f"No checkpoint found at {args.checkpoint_path}")
-    
-    # 设置wandb run ID用于resume
+    # 设置wandb resume
     if wandb_run_id:
         os.environ['WANDB_RUN_ID'] = wandb_run_id
         os.environ['WANDB_RESUME'] = 'must'
     
+    # 创建SimCLR训练器
     simclr = SimCLRSpatilTemporal(
         args=args, 
         model=model, 
         optimizer=optimizer, 
-        scheduler=scheduler
+        scheduler=scheduler,
+        dataset=dataset
     )
+    
+    # 开始训练
     simclr.train(train_loader)
-    print(f"Training completed. Checkpoints and logs are saved in {args.log_dir}")
+    print(f"Training completed. Logs are saved in {args.log_dir}")
     
     
 if __name__ == "__main__":
