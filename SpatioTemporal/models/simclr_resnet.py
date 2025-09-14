@@ -25,11 +25,11 @@ class ResNetSimCLR(nn.Module):
         
     def _get_base_model(self, base_model):
         if base_model == 'resnet18':
-            return models.resnet18(pretrained=False)
+            return models.resnet18(weights=None)
         elif base_model == 'resnet50':
-            return models.resnet50(pretrained=False)
+            return models.resnet50(weights=None)
         elif base_model == 'vit_b_16':
-            return models.vit_b_16(pretrained=False)
+            return models.vit_b_16(weights=None)
         else:
             raise NotImplementedError(f"Base model {base_model} not supported") 
         
