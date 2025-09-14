@@ -73,9 +73,9 @@ class ContrastiveLoss:
         features_pos = features[:,1:]        # [batchsize, n_views-1, feature_dim]
         features_anchor = features[:,:1]        # [batchsize, 1, feature_dim]
 
-        features = torch.cat([features_pos, temporal_negatives], dim=1)     # [batchsize, 1+num_neg, feature_dim]
+        combined_features = torch.cat([features_pos, temporal_negatives], dim=1)     # [batchsize, 1+num_neg, feature_dim]
 
-        similarity_matrix = torch.matmul(features_anchor, features.transpose(1, 2)) # [batchsize, 1, 1+num_neg]
+        similarity_matrix = torch.matmul(features_anchor, combined_features.transpose(1, 2)) # [batchsize, 1, 1+num_neg]
         similarity_matrix = similarity_matrix.squeeze(1)  # [batchsize, 1+num_neg]
         logits = similarity_matrix / temperature
 

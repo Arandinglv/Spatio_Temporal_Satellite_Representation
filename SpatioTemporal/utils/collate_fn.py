@@ -2,15 +2,12 @@ import torch
 
 def custom_collate_fn(batch):
     """
-    处理4个空间邻居的批次数据
-    
     Args:
         batch: 每个样本是包含4个邻居字典的列表
         
     Returns:
         dict: 堆叠后的张量
     """
-    # 直接使用列表推导式和torch.stack进行规整堆叠
     anchors = torch.stack([
         torch.stack([torch.stack(neighbor['anchors']) for neighbor in sample])
         for sample in batch

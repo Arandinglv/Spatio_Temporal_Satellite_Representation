@@ -12,3 +12,7 @@ SpatioTemporal/test_data/
 *.zip
 SpatioTemporal_old
 temp/
+SpatioTemporal/temp*/
+SpatioTemporal/wandb/
+SpatioTemporal/temp*.py
+
