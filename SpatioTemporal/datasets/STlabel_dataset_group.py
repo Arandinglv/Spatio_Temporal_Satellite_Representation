@@ -6,25 +6,30 @@ import pandas as pd
 from PIL import Image
 from torch.utils.data import Dataset
 import ast
-from scipy.stats import *
+# from scipy.stats import *
+from scipy.stats import truncnorm
 
 class STlabelScoreGroupDataset(Dataset):
     
-    def __init__(self, root_folder, num_neg=None, transform=None, transform_neg=None):
+    def __init__(self, root_folder, num_neg=None, transform=None, transform_neg=None, max_epoch=200, current_epoch=0):
         """
         Args:
             root_folder (str): 数据集根目录
             transform (callable, optional): 数据增强方法，用于 anchors，应该返回一个列表
             transform_neg (callable, optional): 数据增强方法，用于 temporal_negatives，应该返回一个 Tensor
             num_tempo_neg_aug (int, optional): 每个时间负样本的增强次数
+            max_epoch (int): 最大训练轮数，来自run.py的args.epochs
+            current_epoch (int): 当前训练轮数，来自simclr.py的训练循环
         """
         self.root_folder = root_folder
         self.transform = transform
         self.transform_neg = transform_neg
         # self.num_tempo_neg_aug = num_tempo_neg_aug
         self.num_neg = num_neg
-        self.years = [str(year) for year in os.listdir(self.root_folder) 
-                if os.path.isdir(os.path.join(self.root_folder, year))]
+        self.max_epoch = max_epoch
+        self.current_epoch = current_epoch
+        self.years = ['2010', '2011', '2012', '2013', '2014', '2015', '2016', '2017', '2018', '2019', '2020']
+        self.years = [year for year in self.years if os.path.isdir(os.path.join(self.root_folder, year))]
         self.image_dict = self._organize_images()
         self.locations = self._filter_locations()
         print(len(self.locations))
@@ -44,7 +49,7 @@ class STlabelScoreGroupDataset(Dataset):
 
     def _calculate_neighbours(self, metadata_df, tile_name):
         # 当前tile的经纬度
-        location = metadata_df.loc[tile_name]
+        location = metadata_df[metadata_df['tile_name'] == tile_name].iloc[0]  # 修复索引问题
         # 邻居信息
         lon = [location["left_top_lon"], location["right_bottom_lon"]]
         lat = [location["left_top_lat"], location["right_bottom_lat"]]
@@ -63,14 +68,15 @@ class STlabelScoreGroupDataset(Dataset):
         allzero_location = set()
         for location_key in all_locations:
             # 过滤掉所有年份为label=0的location
-            labels = [content['label'] for content in self.locations[location_key].values()]
+            labels = [content['label'] for content in self.image_dict[location_key].values()]  # 使用image_dict而不是locations
             if all(label == 0 for label in labels):
                 allzero_location.add(location_key)
 
         # 过滤出邻居含有全0
         invalid_locations = set()
         for location_key in all_locations:
-            neighbours = self.image_dict[location_key]['neighbours']
+            first_year = list(self.image_dict[location_key].keys())[0]  # 需要指定年份访问neighbours
+            neighbours = self.image_dict[location_key][first_year]['neighbours']
             for neighbour in neighbours:
                 if neighbour in allzero_location:
                     invalid_locations.add(location_key)
@@ -94,14 +100,15 @@ class STlabelScoreGroupDataset(Dataset):
         print(f"Invalid locations due to label zero: {len(invalid_locations)}")
         valid_locations = all_locations - invalid_locations
 
-        # 去除边界
-        valid_locations = set()
+        # 去除边界 - 修复逻辑错误
+        boundary_invalid = set()
         for location_key in valid_locations:
-            neighbours = self.image_dict[location_key]['neighbours']
+            first_year = list(self.image_dict[location_key].keys())[0]
+            neighbours = self.image_dict[location_key][first_year]['neighbours']
             if len(neighbours) != 4:
-                invalid_locations.add(location_key)
-        print(f"Invalid locations due to boundary: {len(invalid_locations)}")
-        valid_locations = list(valid_locations-invalid_locations)
+                boundary_invalid.add(location_key)
+        print(f"Invalid locations due to boundary: {len(boundary_invalid)}")
+        valid_locations = list(valid_locations - boundary_invalid)
 
         print(f"Valid locations {len(valid_locations)}")
         return valid_locations
@@ -192,11 +199,9 @@ class STlabelScoreGroupDataset(Dataset):
             }
         """
         location_core = self.locations[idx]
-        # years_available = list(self.image_dict[location_key].keys())
         
-        # # 1) anchor 
+        # 1) anchor 
         anchor_year = random.choice(self.years)
-        # print(anchor_year)
         location_key_quarter_path = self.image_dict[location_core][anchor_year]['neighbours']
         
         dict_list = []
@@ -207,8 +212,9 @@ class STlabelScoreGroupDataset(Dataset):
             anchor_image_path = self.image_dict[location_key][anchor_year]['path']
             anchor_image_label = self.image_dict[location_key][anchor_year]['label']
             anchor_image = Image.open(anchor_image_path).convert('RGB')
+            
             if self.transform:
-                anchors = self.transform(anchor_image)  # list of n_views tensors
+                anchors = self.transform(anchor_image)
                 if not isinstance(anchors, list):
                     raise TypeError(f"Expected anchors to be a list, but got {type(anchors)}")
                 for view in anchors:
@@ -221,25 +227,30 @@ class STlabelScoreGroupDataset(Dataset):
             temporal_negatives = []
             temporal_negatives_ratios = []
 
-            possible_negatives = [year for year in self.years if self.image_dict[location_key][year]['label'] != anchor_image_label]
+            possible_negatives = [
+                year for year in self.years 
+                if self.image_dict[location_key][year]['label'] != anchor_image_label
+            ]
 
             # TODO: sigma 变换
-            #
-            # current_sigma = 0.3 + (max_epoch -  current_epoch)
-
+            current_sigma = 0.3 + (self.max_epoch - self.current_epoch)
             a = (0-0) / current_sigma
             b = (1-0) / current_sigma
 
-            possible_negatives_sorted = sorted(possible_negatives, key=lambda y:abs(int(y)-int(anchor_year)))
+            # 现在 abs 是内置函数，不会有问题
+            possible_negatives_sorted = sorted(
+                possible_negatives, 
+                key=lambda y: abs(int(y) - int(anchor_year))
+            )
 
-            if self.current_epoch <= self.max_epoches:
-                r = truncnorm.rvs(a,b, loc = 0, scale = current_sigma, size=self.nunm_neg)
-                neg_indexs = (r*len(possible_negatives_sorted)).astype(int)
+            if self.current_epoch <= self.max_epoch:
+                r = truncnorm.rvs(a, b, loc=0, scale=current_sigma, size=self.num_neg)
+                neg_indexs = (r * len(possible_negatives_sorted)).astype(int)
             else:
-                neg_indexs = sorted(np.random.choice(range(len(possible_negatives)), size=self.nunm_neg, replace=True))
+                neg_indexs = sorted(np.random.choice(range(len(possible_negatives)), size=self.num_neg, replace=True))
 
             for neg_index in neg_indexs:
-                neg_year = possible_negatives_sorted[neg_index]
+                neg_year = possible_negatives_sorted[neg_index]  # 使用排序后的列表
                 neg_image_path = self.image_dict[location_key][neg_year]['path']
                 neg_image = Image.open(neg_image_path).convert('RGB')
 
@@ -252,23 +263,15 @@ class STlabelScoreGroupDataset(Dataset):
                     raise ValueError("Transform must be provided to convert images to tensors.")
 
                 ratio_dict = self.image_dict[location_key][anchor_year]['ratios']
-                ratio_list = ratio_dict[str(neg_year)]
+                ratio_list = ratio_dict[neg_year]  # neg_year 是字符串，直接使用
 
                 ratio_tensor = torch.tensor(ratio_list, dtype=torch.float32) 
                 temporal_negatives_ratios.append(ratio_tensor) 
-            
 
             dict_list.append({
-            "anchors": anchors,  # list of Tensors, shape: [n_views, C, H, W]
-            "temporal_negatives": temporal_negatives,  # list of tensors: [num_neg, C, H, W]
-            "temporal_negatives_ratios": temporal_negatives_ratios,  # list of tensors: [num_neg, label_num]
+                "anchors": anchors,
+                "temporal_negatives": temporal_negatives,
+                "temporal_negatives_ratios": temporal_negatives_ratios,
             })
-            # 这里一次性送入四张图
 
-    
         return dict_list
-        
-    # @property
-    # def num_valid_locations(self):
-    #     return len(self.locations)
-
