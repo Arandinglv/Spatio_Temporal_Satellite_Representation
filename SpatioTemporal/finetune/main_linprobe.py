@@ -1,180 +1,145 @@
-import os
-import torch 
-import torch.nn as nn   
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-from torch.utils.data import DataLoader
-import torch.backends.cudnn as cudnn
-from argparse import ArgumentParser
-import numpy as np
+import argparse
+import torch
+import torch.nn as nn
 import wandb
-
-from utils.crop import RandomResizedCrop
+import sys
 from models.simclr_resnet import ResNetSimCLR
-from engine_finetune import evaluate, train_one_epoch
-from downstream_datasets import create_dataset
-from datasets.datasets_inference import BigEarthNet
+from models.softcon import SoftCon, load_checkpoint_rgb
+import os
+
+
+from ft_datasets.Eurosat import build_eurosat_dataset
+from engine_finetune import train_one_epoch, evaluate
+
+# export WANDB_API_KEY=your_api_key_here 
+
+
+def get_args_parser():
+    parser = argparse.ArgumentParser('Linear probing for ResNetSimCLR', add_help=False)
+    parser.add_argument('--batch_size', default=128, type=int)
+    parser.add_argument('--epochs', default=100, type=int)
+    parser.add_argument('--lr', default=1e-2, type=float)
+    parser.add_argument('--weight_decay', default=1e-4, type=float)
+    parser.add_argument('--model', default='resnetsimclr', type=str, choices=['softcon', 'resnetsimclr'])
+    parser.add_argument('--base_model', default='resnet50', type=str)
+    parser.add_argument('--checkpoint', required=True, type=str, help='Path to SimCLR checkpoint')
+    parser.add_argument('--device', default='cuda', type=str)
+    parser.add_argument('--num_workers', default=8, type=int)
+    parser.add_argument('--wandb', type=str, default='linprobe', help='Wandb project name')
+    parser.add_argument('--dataset_type', default='eurosat', type=str)
+    return parser
 
 
 def main():
-    parser = ArgumentParser()
-    parser.add_argument('--data_dir', type=str, default='/data/yutianjiang/datasets/Eurosat_RGB')
-    parser.add_argument('--dataset_type', type=str, default='eurosat', choices=['eurosat', 'bigearthnet', 'indicator'])
-    parser.add_argument('--batch_size', type=int, default=512)
-    parser.add_argument('--num_workers', type=int, default=8)
-    parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--warmup_epochs', type=int, default=10)
-    parser.add_argument('--lr', type=float, default=0.1)
-    parser.add_argument('--checkpoint', type=str, 
-                        default='/data/yutianjiang/training_results/spatio_temporal/vanilla/Guangzhou/label_soft_all/label_soft_pretrain_on_ST/resnet18.pth.tar')
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--classes_num', type=int, default=10)
-    parser.add_argument('--base_model', type=str, default='resnet18', 
-                        choices=['resnet18', 'resnet50', 'resnet101', 'resnet152'])
-    parser.add_argument('--accum_iter', type=int, default=1)
-    parser.add_argument('--indicator', type=str, default=None, choices=["carbon", "population", "gdp"])
-    parser.add_argument('--indicator_city', type=str, default=None, choices=["Guangzhou"])
-    parser.add_argument('--train_dataset_ratio', type=float, default=0.8)
-    
-    # Wandb parameters
-    parser.add_argument('--project_name', type=str, default=None, help="Wandb project name")
-    parser.add_argument('--experiment_name', type=str, default=None, help="Wandb experiment name")
-    
-    args = parser.parse_args()
-    
-    # Set seed
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    cudnn.benchmark = True
-    
-    # Initialize wandb
-    if args.project_name:
-        exp_name = args.experiment_name or f"{args.dataset_type}_{args.base_model}_linprobe"
-        wandb.init(project=args.project_name, name=exp_name, config=args)
-        args.wandb = args.project_name  # For engine compatibility
-    
-    # Data transforms
-    transform_train = transforms.Compose([
-        RandomResizedCrop(224, interpolation=3),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+    args = get_args_parser().parse_args()
+    device = torch.device(args.device)
 
-    transform_val = transforms.Compose([
-        transforms.Resize(256, interpolation=3),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    
-    # Load datasets
-    if args.dataset_type == 'eurosat':
-        train_dataset = datasets.ImageFolder(root=os.path.join(args.data_dir, 'train'), transform=transform_train)
-        val_dataset = datasets.ImageFolder(root=os.path.join(args.data_dir, 'val'), transform=transform_val)
-    elif args.dataset_type == 'bigearthnet':
-        train_dataset = BigEarthNet(root_folder=args.data_dir, transform=transform_train, type='train')
-        val_dataset = BigEarthNet(root_folder=args.data_dir, transform=transform_val, type='val')
-    elif args.dataset_type == 'indicator':
-        train_dataset, val_dataset, _, _, _ = create_dataset.create_indicator_datasets(
-            args=args, transform_train=transform_train, transform_val=transform_val)
-    
-    # Data loaders
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-    
-    # Load model
-    model = ResNetSimCLR(base_model=args.base_model)
-    model.to(args.device)
-    
-    # Load pretrained weights
-    checkpoint = torch.load(args.checkpoint, map_location='cpu')
-    msg = model.load_state_dict(checkpoint['state_dict'], strict=False)
-    print("Loading pretrained weights:", msg)
-    
-    # Linear probing setup
-    print("=> Linear probing mode")
-    for _, param in model.named_parameters():
-        param.requires_grad = False
-    model.projection = nn.Identity()
-    
-    # Get encoder output dimension
-    with torch.no_grad():
-        dummy_input = torch.zeros(1, 3, 224, 224).to(args.device)
-        features = model(dummy_input)
-        feature_dim = features.shape[1]
-    print(f"Encoder output dimension: {feature_dim}")
-    
-    # Create classification head
-    head = nn.Sequential(
-        nn.BatchNorm1d(feature_dim, affine=False, eps=1e-6),
-        nn.Linear(feature_dim, args.classes_num)
+
+    # api_key = os.environ.get("8f2fc4596fca723c90b10053eeaead122e46603a")
+    # wandb.login(key=api_key, relogin=True)
+
+    # Build datasets
+    dataset_train = build_eurosat_dataset(is_train=True, args=args)
+    dataset_val = build_eurosat_dataset(is_train=False, args=args)
+
+    data_loader_train = torch.utils.data.DataLoader(
+        dataset_train, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True, drop_last=True
     )
-    head.to(args.device)
-    
-    # Optimizer
-    optimizer = torch.optim.AdamW(head.parameters(), lr=args.lr)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs - args.warmup_epochs)
-    
-    # Loss function
-    if args.dataset_type == 'eurosat':
-        criterion = nn.CrossEntropyLoss()
-    elif args.dataset_type == 'bigearthnet':
-        criterion = nn.BCEWithLogitsLoss()
-    elif args.dataset_type == 'indicator':
-        criterion = nn.MSELoss()
-    
-    print(f"Start training for {args.epochs} epochs")
-    best_acc1 = 0.0
-    best_mse = 1e6
-    
-    # Training loop
-    for epoch in range(args.epochs):
-        train_stats = train_one_epoch(model, head, criterion, train_loader, optimizer, args.device, epoch, args, model_freeze=True)
-        
-        if epoch >= args.warmup_epochs:
-            lr_scheduler.step()
 
-        val_stats = evaluate(val_loader, model, head, args.device, criterion, args)
-        
-        # Log and track best
-        if args.dataset_type == 'indicator':
-            print(f"[Epoch {epoch:3d}] Train Loss: {train_stats['loss']:.4f}, Val MSE: {val_stats['mse']:.4f}, R²: {val_stats['r2']:.4f}")
-            
-            if args.project_name:
-                wandb.log({
-                    'epoch': epoch, 'train_loss': train_stats['loss'], 'val_loss': val_stats['loss'],
-                    'val_mse': val_stats['mse'], 'val_rmse': val_stats['rmse'], 
-                    'val_mae': val_stats['mae'], 'val_r2': val_stats['r2']
-                })
-            
-            if val_stats['mse'] < best_mse:
-                best_mse = val_stats['mse']
-        else:
-            print(f"[Epoch {epoch:3d}] Train Loss: {train_stats['loss']:.4f}, Val Acc@1: {val_stats['acc1']*100:.2f}%")
-            
-            if args.project_name:
-                wandb.log({
-                    'epoch': epoch, 'train_loss': train_stats['loss'], 'val_loss': val_stats['loss'],
-                    'val_acc1': val_stats['acc1'], 'val_acc5': val_stats['acc5']
-                })
-            
-            if val_stats['acc1'] > best_acc1:
-                best_acc1 = val_stats['acc1']
-    
-    # Final results
-    if args.dataset_type == 'indicator':
-        print(f"Training completed. Best val MSE = {best_mse:.4f}")
-        if args.project_name:
-            wandb.log({'best_val_mse': best_mse})
+    data_loader_val = torch.utils.data.DataLoader(
+        dataset_val, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True, drop_last=False
+    )
+
+    # Load model
+    if args.model == 'resnetsimclr':
+        # Create model with original architecture
+        model = ResNetSimCLR(base_model=args.base_model, out_dim=128)
+
+        # Load checkpoint
+        checkpoint = torch.load(args.checkpoint, map_location='cpu')
+        state_dict = checkpoint['state_dict']
+
+        # Load weights
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        print(f"Missing keys: {missing_keys}")
+        print(f"Unexpected keys: {unexpected_keys}")
+
+        # Freeze all parameters for pure linear probing
+        for param in model.parameters():
+            param.requires_grad = False
+
+        # Remove last layer of projection and add classification head
+        model.projection = model.projection[:3]  # Keep first two layers: Linear-ReLU-Linear
+        feature_dim = model.projection[2].out_features
+
+        head = nn.Linear(feature_dim, 10)  
+
+    elif args.model == 'softcon':
+        model = SoftCon(base_model=args.base_model)
+        checkpoint = torch.load(args.checkpoint, map_location='cpu')
+        state_dict = checkpoint
+        missing_keys, unexpected_keys = load_checkpoint_rgb(model, args.checkpoint)
+        print(f"Missing keys: {missing_keys}")
+        print(f"Unexpected keys: {unexpected_keys}")
+
+        # Freeze all parameters for pure linear probing
+        for param in model.parameters():
+            param.requires_grad = False
+
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 224, 224)
+            feature_dim = model(dummy_input).shape[1]
+        head = nn.Linear(feature_dim, 10)  
+
     else:
-        print(f"Training completed. Best val acc@1 = {best_acc1*100:.2f}%")
-        if args.project_name:
-            wandb.log({'best_val_acc1': best_acc1})
-    
-    if args.project_name:
-        wandb.finish()
+        raise NotImplementedError(f"Model {args.model} not supported")
 
 
-if __name__ == "__main__":
+    model.to(device)
+    head.to(device)
+    # model.eval()
+
+    # Optimizer only for classification head
+    optimizer = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    criterion = nn.CrossEntropyLoss()
+
+    # Initialize wandb
+    if args.wandb:
+        wandb.init(project=args.wandb)
+        wandb.config.update(args)
+
+    print(f"Start linear probing for {args.epochs} epochs")
+    best_acc = 0.0
+
+    for epoch in range(args.epochs):
+        # Train
+        train_stats = train_one_epoch(
+            model, head, criterion, data_loader_train,
+            optimizer, device, epoch, args, model_freeze=True
+        )
+
+        # Evaluate
+        test_stats = evaluate(
+            data_loader_val, model, head, device, criterion, args
+        )
+
+        acc = test_stats['acc1'] * 100
+        print(f"Epoch {epoch}: Train Loss = {train_stats['loss']:.4f}, Test Acc = {acc:.2f}%")
+
+        best_acc = max(best_acc, acc)
+
+        if args.wandb:
+            wandb.log({
+                'epoch': epoch,
+                'train_loss': train_stats['loss'],
+                'test_acc': acc,
+                'best_acc': best_acc
+            })
+
+    print(f"Best accuracy: {best_acc:.2f}%")
+
+
+if __name__ == '__main__':
     main()
