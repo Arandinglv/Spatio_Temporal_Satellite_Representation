@@ -24,7 +24,7 @@ class ContrastiveLoss:
         
         anchors = F.normalize(anchors, dim=1)  # [batchsize, 128]
         temporal_negatives = F.normalize(temporal_negatives, dim=2)
-        
+
         group_ids = torch.arange(group_num, device=device).repeat_interleave(group_element).view(-1, 1)  
         # [batchsize,] -> [batchsize, 1]
         group_mask = (group_ids == group_ids.t())  # 不用device [batchsize, batchsize]
@@ -43,8 +43,13 @@ class ContrastiveLoss:
         A_prime = temporal_negatives[batch_indices, indices]  # [batchsize, 128]
         B = anchors[min_sim_indices]  # [batchsize, 128]
         B_prime = temporal_negatives[min_sim_indices, indices[min_sim_indices]]  # [batchsize, 8]
+
+        A_prime = A_prime.clone()
+        B = B.clone()
+        B_prime = B_prime.clone()
+
         # 锁定B的位置后找到相应的负样本
-        
+
         diff_A = F.normalize((anchors - A_prime), dim=1)   # [batch_size, 128]
         diff_B = F.normalize((B - B_prime), dim=1)   # [batch_size, 128]
         loss = torch.mean((1 - torch.sum(diff_A * diff_B, dim=1)) * torch.sum(anchors * B, dim=1))

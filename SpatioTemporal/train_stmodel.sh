@@ -4,14 +4,14 @@
 # 训练spatio-temporal SimCLR模型
 # 使用广州数据集
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=3
 
 python run.py \
     --data /hpc2hdd/home/qwang650/project/yutianjiang/stmodel/dataset/Guangzhou \
     --dataset-name STlabelScoreGroupDataset \
     --arch resnet50 \
     --epochs 100 \
-    --batch-size 16 \
+    --batch-size 20 \
     --lr 0.0003 \
     --weight-decay 1e-4 \
     --seed 42 \

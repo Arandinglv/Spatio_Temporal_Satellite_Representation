@@ -196,12 +196,31 @@ def main():
         betas=(0.9, 0.999)
     )
     
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, 
-        T_max=len(train_loader) * args.epochs, 
-        eta_min=0, 
-        last_epoch=-1
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    #     optimizer, 
+    #     T_max=len(train_loader) * args.epochs, 
+    #     eta_min=0, 
+    #     last_epoch=-1
+    # )
+        # 自定义学习率调度器：前20个epoch线性增加到3e-4，之后保持不变
+    def lr_lambda(epoch):
+        if epoch < args.warmup_epochs:  # 前20个epoch
+            # 从0线性增加到1
+            return (epoch + 1) / args.warmup_epochs
+        else:
+            # 20个epoch之后保持不变
+            return 1.0
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lr_lambda
     )
+    
+    # 设置目标学习率为3e-4
+    args.lr = 3e-4
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = 0.0  # 确保初始学习率为0
+        param_group['initial_lr'] = args.lr  # 设置目标学习率
 
     # Resume模型状态
     if args.resume and args.checkpoint_path and os.path.isfile(args.checkpoint_path):
