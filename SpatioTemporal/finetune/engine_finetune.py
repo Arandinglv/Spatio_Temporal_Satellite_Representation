@@ -9,7 +9,10 @@ from timm.utils import accuracy
 
 
 def train_one_epoch(model, head, criterion, data_loader, optimizer, device, epoch, args, model_freeze=True):
-    model.train(not model_freeze)
+    if model_freeze:
+        model.eval()  # Use eval mode for frozen model to disable dropout/batchnorm updates
+    else:
+        model.train()
     if head is not None:
         head.train(True)
     
@@ -53,13 +56,13 @@ def train_one_epoch(model, head, criterion, data_loader, optimizer, device, epoc
         total_loss += loss.item()
         num_batches += 1
         
-        # Log to wandb every 20 batches
-        if batch_idx % 20 == 0 and args.wandb:
-            wandb.log({
-                'train_loss_step': loss.item(),
-                'epoch': epoch,
-                'batch': batch_idx
-            })
+        # Disable frequent wandb logging for faster training
+        # if batch_idx % 100 == 0 and hasattr(args, 'wandb') and args.wandb:
+        #     wandb.log({
+        #         'train_loss_step': loss.item(),
+        #         'epoch': epoch,
+        #         'batch': batch_idx
+        #     })
     
     avg_loss = total_loss / num_batches
     print(f"Train Epoch {epoch}: Average Loss = {avg_loss:.4f}")
