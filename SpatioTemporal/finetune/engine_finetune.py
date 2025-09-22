@@ -109,7 +109,10 @@ def evaluate(data_loader, model, head, device, criterion, args):
             outputs = head(features)
         else:
             outputs = features
-            
+
+        if task_type == "regression":
+            outputs = outputs.squeeze()
+            targets = targets.squeeze()
         loss = criterion(outputs, targets)
         total_loss += loss.item()
         num_batches += 1
