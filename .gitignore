@@ -3,7 +3,12 @@
 *.pdf
 *.json
 __pycache__
-baselines/
+baselines/dinov2
+baselines/mocov3
+baselines/SimCLR
+baselines/softcon
+baselines/seasonal-contrast
+baselines/SatMAE
 SpatioTemporal/exceptions/__pycache__/
 SpatioTemporal/models/__pycache__/
 SpatioTemporal/utils/__pycache__/
