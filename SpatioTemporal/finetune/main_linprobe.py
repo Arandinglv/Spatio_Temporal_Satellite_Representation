@@ -9,9 +9,10 @@ import os
 
 
 from ft_datasets.Eurosat import build_eurosat_dataset
+from ft_datasets.Indicator_utils import *
 from engine_finetune import train_one_epoch, evaluate
 
-# export WANDB_API_KEY=your_api_key_here 
+# export WANDB_API_KEY=your_api_key_here
 
 
 def get_args_parser():
@@ -26,7 +27,11 @@ def get_args_parser():
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--num_workers', default=8, type=int)
     parser.add_argument('--wandb', type=str, default='linprobe', help='Wandb project name')
-    parser.add_argument('--dataset_type', default='eurosat', type=str)
+    parser.add_argument('--dataset_type', default='eurosat', choices=["eurosat", "indicator"],type=str)
+    parser.add_argument('--train_dataset_ratio', default='0.8',type=float, help="from 0 to 1, for indicator only")
+    parser.add_argument("--indicator",choices=["gdp", "population"], type=str, help="select indicator for prediction")
+    parser.add_argument("--city", default = "Guangzhou", type=str, help="city for indicator prediction")
+    parser.add_argument("--test_file", default = None, type=str, help="indicator only")
     return parser
 
 
@@ -39,8 +44,13 @@ def main():
     # wandb.login(key=api_key, relogin=True)
 
     # Build datasets
-    dataset_train = build_eurosat_dataset(is_train=True, args=args)
-    dataset_val = build_eurosat_dataset(is_train=False, args=args)
+    if args.dataset_type == 'eurosat':
+        dataset_train = build_eurosat_dataset(is_train=True, args=args)
+        dataset_val = build_eurosat_dataset(is_train=False, args=args)
+    elif args.dataset_type == 'indicator':
+        dataset_train, dataset_val, test_dataset, mean, std = create_indicator_datasets(args=args)
+    else:
+        raise Exception("Invalid dataset type")
 
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, batch_size=args.batch_size, shuffle=True,
@@ -74,7 +84,10 @@ def main():
         model.projection = model.projection[:3]  # Keep first two layers: Linear-ReLU-Linear
         feature_dim = model.projection[2].out_features
 
-        head = nn.Linear(feature_dim, 10)  
+        if args.dataset_type == 'indicator':
+            head = nn.Linear(feature_dim, 1)
+        else:
+            head = nn.Linear(feature_dim, 10)
 
     elif args.model == 'softcon':
         model = SoftCon(base_model=args.base_model)
@@ -91,7 +104,11 @@ def main():
         with torch.no_grad():
             dummy_input = torch.randn(1, 3, 224, 224)
             feature_dim = model(dummy_input).shape[1]
-        head = nn.Linear(feature_dim, 10)  
+
+        if args.dataset_type == 'indicator':
+            head = nn.Linear(feature_dim, 1)
+        else:
+            head = nn.Linear(feature_dim, 10)
 
     else:
         raise NotImplementedError(f"Model {args.model} not supported")
@@ -103,7 +120,11 @@ def main():
 
     # Optimizer only for classification head
     optimizer = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    criterion = nn.CrossEntropyLoss()
+
+    if args.dataset_type == 'indicator':
+        criterion = nn.MSELoss()
+    else:
+        criterion = nn.CrossEntropyLoss()
 
     # Initialize wandb
     if args.wandb:
@@ -112,6 +133,7 @@ def main():
 
     print(f"Start linear probing for {args.epochs} epochs")
     best_acc = 0.0
+    best_mae = 1000
 
     for epoch in range(args.epochs):
         # Train
@@ -125,20 +147,46 @@ def main():
             data_loader_val, model, head, device, criterion, args
         )
 
-        acc = test_stats['acc1'] * 100
-        print(f"Epoch {epoch}: Train Loss = {train_stats['loss']:.4f}, Test Acc = {acc:.2f}%")
+        if args.dataset_type == 'indicator':
+            print(f"Epoch {epoch}: Train Loss = {test_stats['loss']:.4f}, \
+            mse={test_stats['mse']:.2f}, \
+            rmse={test_stats['rmse']:.2f}, \
+            mae={test_stats['mae']:.2f}, \
+            mape={test_stats['mape']:.2f},\
+            r2={test_stats['r2']:.2f}")
 
-        best_acc = max(best_acc, acc)
+            mae=test_stats['mae']
+            best_mae =  min(best_mae, mae)
 
-        if args.wandb:
-            wandb.log({
-                'epoch': epoch,
-                'train_loss': train_stats['loss'],
-                'test_acc': acc,
-                'best_acc': best_acc
-            })
+            if args.wandb:
+                wandb.log({
+                    'epoch': epoch,
+                    'train_loss': test_stats['loss'],
+                    'mse': test_stats['mse'],
+                    'rmse': test_stats['rmse'],
+                    'mae': test_stats['mae'],
+                    'mape': test_stats['mape'],
+                    'r2': test_stats['r2']
+                })
 
-    print(f"Best accuracy: {best_acc:.2f}%")
+        else:
+            acc = test_stats['acc1'] * 100
+            print(f"Epoch {epoch}: Train Loss = {train_stats['loss']:.4f}, Test Acc = {acc:.2f}%")
+
+            best_acc = max(best_acc, acc)
+
+            if args.wandb:
+                wandb.log({
+                    'epoch': epoch,
+                    'train_loss': train_stats['loss'],
+                    'test_acc': acc,
+                    'best_acc': best_acc
+                })
+
+    if args.dataset_type == 'indicator':
+        print(f"Best mae: {best_mae:.2f}")
+    else:
+        print(f"Best accuracy: {best_acc:.2f}%")
 
 
 if __name__ == '__main__':
