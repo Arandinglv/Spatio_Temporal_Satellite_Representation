@@ -3,7 +3,9 @@ import argparse
 from posixpath import isfile
 import torch
 import torch.backends.cudnn as cudnn
+import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from datetime import datetime
 import wandb
 
@@ -91,6 +93,16 @@ def main():
                         help='Use cuda for training')
     parser.add_argument('--mixed-precision', default=False, action='store_true',
                         help='Use mixed precision training')
+
+    # DDP参数
+    parser.add_argument('--world-size', default=4, type=int,
+                        help='number of distributed processes')
+    parser.add_argument('--local_rank', default=-1, type=int,
+                        help='local rank for distributed training')
+    parser.add_argument('--dist-backend', default='nccl', type=str,
+                        help='distributed backend')
+    parser.add_argument('--dist-url', default='env://', type=str,
+                        help='url used to set up distributed training')
     
     # Wandb 参数
     parser.add_argument('--wandb-project', default='stmodel-simclr', type=str,
@@ -115,16 +127,42 @@ def main():
                         help='path to checkpoint for resume')
     
     args = parser.parse_args()
-    
+
+    # DDP初始化 - SOTA标准实现
+    args.distributed = False
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        args.rank = int(os.environ["RANK"])
+        args.world_size = int(os.environ['WORLD_SIZE'])
+        args.local_rank = int(os.environ['LOCAL_RANK'])
+        args.distributed = True
+
+        torch.cuda.set_device(args.local_rank)
+        args.dist_backend = 'nccl'
+        print(f'| distributed init (rank {args.rank}/{args.world_size}): {args.dist_url}', flush=True)
+
+        dist.init_process_group(
+            backend=args.dist_backend,
+            init_method=args.dist_url,
+            world_size=args.world_size,
+            rank=args.rank
+        )
+        dist.barrier()
+        print(f'Rank {args.rank}: DDP initialization completed', flush=True)
+    else:
+        print('Not using distributed mode - single GPU training')
+        args.rank = 0
+        args.local_rank = 0
+        args.world_size = 1
+
     # 设置随机种子
     if args.seed is not None:
-        torch.manual_seed(args.seed)
-        torch.cuda.manual_seed(args.seed)
-        torch.cuda.manual_seed_all(args.seed)
+        torch.manual_seed(args.seed + args.rank)
+        torch.cuda.manual_seed(args.seed + args.rank)
+        torch.cuda.manual_seed_all(args.seed + args.rank)
         import numpy as np
         import random
-        np.random.seed(args.seed)
-        random.seed(args.seed)
+        np.random.seed(args.seed + args.rank)
+        random.seed(args.seed + args.rank)
     
     # 验证group参数 - batch_size就是group_num
     if args.group:
@@ -145,13 +183,15 @@ def main():
     
     # 设备设置
     if torch.cuda.is_available() and args.cuda:
-        args.device = torch.device('cuda')
+        args.device = torch.device(f'cuda:{args.local_rank}')
         cudnn.deterministic = True
         cudnn.benchmark = True
-        print('========== Using GPU ==========')
-    else: 
+        if args.rank == 0:
+            print('========== Using GPU with DDP ==========')
+    else:
         args.device = torch.device('cpu')
-        print('========== Using CPU ==========')
+        if args.rank == 0:
+            print('========== Using CPU ==========')
         
     assert args.n_views == 2, "Only two view training is supported. Please use --n-views 2."
     
@@ -174,11 +214,12 @@ def main():
     )
     train_dataset = dataset.get_dataset(args.dataset_name, args.n_views)
     
-    # DataLoader - batch_size就是group_num
+    # DataLoader - batch_size就是group_num，使用DistributedSampler
+    train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.rank)
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=args.batch_size,  # 这里就是group_num
-        shuffle=True, 
+        train_dataset,
+        batch_size=args.batch_size,  # 每个GPU上的batch_size
+        sampler=train_sampler,  # 使用DistributedSampler而不是shuffle
         num_workers=args.workers,
         pin_memory=True,
         drop_last=True,
@@ -237,11 +278,12 @@ def main():
     
     # 创建SimCLR训练器
     simclr = SimCLRSpatilTemporal(
-        args=args, 
-        model=model, 
-        optimizer=optimizer, 
+        args=args,
+        model=model,
+        optimizer=optimizer,
         scheduler=scheduler,
-        dataset=dataset
+        dataset=dataset,
+        train_sampler=train_sampler
     )
     
     # 开始训练
